@@ -10,6 +10,21 @@ import { PORT } from './modify.js';
 
 const SCRIPT_TIMEOUT = 30 * 60 * 1000; // 30 minutes (cargo/source builds are slow)
 
+const POLL_INTERVAL = 2000;
+
+// The server's data is already on disk by the time we poll, so this only covers
+// process startup.
+const SERVER_READY_TIMEOUT = 60 * 1000;
+
+// The docker_nginx container downloads the frontend and converts a bounding box
+// out of osm/satellite/elevation before the backend starts listening, so its
+// budget is dominated by download speed. Observed ~74s on a healthy runner and
+// >127s on a slow one — keep enough headroom that ordinary variance passes.
+const BACKEND_READY_TIMEOUT = 6 * 60 * 1000;
+
+// nginx only has to proxy to an already-healthy backend.
+const NGINX_READY_TIMEOUT = 30 * 1000;
+
 export function createWorkDir(): string {
 	const workDir = join(
 		tmpdir(),
@@ -62,6 +77,43 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Polls `check` until it reports readiness or `timeout` elapses.
+ *
+ * `check` returns a status message once ready, and null (or throws) while not.
+ * Elapsed time is logged on every attempt so a future timeout shows how far off
+ * the budget was rather than just an attempt count.
+ */
+async function pollUntilReady(
+	what: string,
+	timeout: number,
+	check: () => Promise<string | null>
+): Promise<void> {
+	const start = Date.now();
+	for (let attempt = 1; ; attempt++) {
+		let status: string | null;
+		try {
+			status = await check();
+		} catch {
+			status = null;
+		}
+
+		const elapsed = Math.round((Date.now() - start) / 1000);
+		if (status !== null) {
+			console.log(`    Attempt ${attempt} (${elapsed}s): ${status}`);
+			return;
+		}
+
+		if (Date.now() - start >= timeout) {
+			throw new Error(
+				`${what} did not become ready within ${timeout / 1000}s (${attempt} attempts)`
+			);
+		}
+		console.log(`    Attempt ${attempt} (${elapsed}s): not ready — retrying...`);
+		await sleep(POLL_INTERVAL);
+	}
+}
+
 export async function waitForServer(methodKey: string, workDir: string): Promise<void> {
 	if (methodKey === 'docker_nginx') {
 		await waitForDockerNginx();
@@ -78,20 +130,7 @@ async function waitForProcess(workDir: string): Promise<void> {
 	console.log(`    Server PID: ${pid}`);
 
 	console.log(`=== Health check: polling http://localhost:${PORT}/status ===`);
-	for (let i = 1; i <= 15; i++) {
-		try {
-			const res = await fetch(`http://localhost:${PORT}/status`);
-			if (res.ok) {
-				console.log(`    Attempt ${i}: HTTP ${res.status} — OK`);
-				return;
-			}
-			console.log(`    Attempt ${i}: HTTP ${res.status} — retrying...`);
-		} catch {
-			console.log(`    Attempt ${i}: not ready — retrying...`);
-		}
-		await sleep(2000);
-	}
-	throw new Error('Server did not become ready after 15 attempts');
+	await pollUntilReady('Server', SERVER_READY_TIMEOUT, statusEndpointCheck);
 }
 
 async function waitForDocker(): Promise<void> {
@@ -99,20 +138,12 @@ async function waitForDocker(): Promise<void> {
 	verifyContainerRunning();
 
 	console.log(`=== Health check: polling http://localhost:${PORT}/status ===`);
-	for (let i = 1; i <= 15; i++) {
-		try {
-			const res = await fetch(`http://localhost:${PORT}/status`);
-			if (res.ok) {
-				console.log(`    Attempt ${i}: HTTP ${res.status} — OK`);
-				return;
-			}
-			console.log(`    Attempt ${i}: HTTP ${res.status} — retrying...`);
-		} catch {
-			console.log(`    Attempt ${i}: not ready — retrying...`);
-		}
-		await sleep(2000);
-	}
-	throw new Error('Server did not become ready after 15 attempts');
+	await pollUntilReady('Server', SERVER_READY_TIMEOUT, statusEndpointCheck);
+}
+
+async function statusEndpointCheck(): Promise<string | null> {
+	const res = await fetch(`http://localhost:${PORT}/status`);
+	return res.ok ? `HTTP ${res.status} — OK` : null;
 }
 
 async function waitForDockerNginx(): Promise<void> {
@@ -121,32 +152,24 @@ async function waitForDockerNginx(): Promise<void> {
 
 	// Poll backend directly via docker exec to avoid nginx caching 502
 	console.log('=== Health check: polling backend via docker exec ===');
-	for (let i = 1; i <= 60; i++) {
-		try {
-			execSync('docker exec versatiles curl -sf http://127.0.0.1:8080/status', {
-				stdio: 'pipe'
-			});
-			console.log(`    Attempt ${i}: backend OK`);
-			break;
-		} catch {
-			if (i === 60) throw new Error('Backend did not become ready after 60 attempts');
-			console.log(`    Attempt ${i}: backend not ready — retrying...`);
-		}
-		await sleep(2000);
-	}
+	await pollUntilReady('Backend', BACKEND_READY_TIMEOUT, async () => {
+		execSync('docker exec versatiles curl -sf http://127.0.0.1:8080/status', {
+			stdio: 'pipe'
+		});
+		return 'backend OK';
+	});
 
-	// Verify nginx is accepting connections
+	// Verify nginx is accepting connections. Not fatal — the backend is already
+	// healthy, and the test itself will fail if nginx never comes up.
 	console.log(`    Checking nginx on port ${PORT}...`);
 	await sleep(1000);
-	for (let i = 1; i <= 5; i++) {
-		try {
+	try {
+		await pollUntilReady('nginx', NGINX_READY_TIMEOUT, async () => {
 			const res = await fetch(`http://localhost:${PORT}/`);
-			console.log(`    nginx responding: HTTP ${res.status}`);
-			return;
-		} catch {
-			console.log(`    nginx not ready — retrying...`);
-		}
-		await sleep(2000);
+			return `nginx responding: HTTP ${res.status}`;
+		});
+	} catch (error) {
+		console.log(`    ${error instanceof Error ? error.message : String(error)}`);
 	}
 }
 
