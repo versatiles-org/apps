@@ -27,15 +27,17 @@ interface BuildResult {
 const MIN_NODE_SIZE = 16;
 const CV_THRESHOLD = 0.5; // Coefficient of variation threshold for collapsing to mean
 const CONCURRENCY = 4; // Number of concurrent tile index fetches
+const MAX_ATTEMPTS = 5; // Attempts per HTTP request before giving up
+const RETRY_DELAY = 2000; // Delay before the first retry, doubled on each further attempt
 
 // --- Main ---
 
 async function main(url: string, outputPath: string): Promise<void> {
 	console.log(`Building ${outputPath} from ${url}`);
 	const container = new Container(url);
-	const header = await container.getHeader();
+	const header = await withRetry('header', () => container.getHeader());
 
-	const blockIndex = await container.getBlockIndex();
+	const blockIndex = await withRetry('block index', () => container.getBlockIndex());
 
 	// Group blocks by zoom level and count total
 	const blocksByZoom = new Map<number, Block[]>();
@@ -97,8 +99,9 @@ async function fetchAllTileIndices(
 			while (running < CONCURRENCY && idx < blocks.length) {
 				const block = blocks[idx++];
 				running++;
-				container
-					.getTileIndex(block)
+				withRetry(`tile index ${block.level}/${block.column}/${block.row}`, () =>
+					container.getTileIndex(block)
+				)
 					.then((tileIndex) => {
 						const key = `${block.column},${block.row}`;
 						map.set(key, { block, lengths: tileIndex.lengths });
@@ -241,6 +244,36 @@ function collectStats(
 }
 
 // --- Utilities ---
+
+/**
+ * Retries a failed request with exponential backoff.
+ *
+ * A full build issues tens of thousands of HTTP range requests, so an occasional
+ * stalled or reset connection is normal. The container's HTTP reader aborts a
+ * request after 10s of idle time; without retries a single such stall throws an
+ * unhandled rejection and discards the whole ~20 minute build.
+ */
+async function withRetry<T>(what: string, fn: () => Promise<T>): Promise<T> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await fn();
+		} catch (error) {
+			if (attempt >= MAX_ATTEMPTS) throw error;
+			const delay = RETRY_DELAY * 2 ** (attempt - 1);
+			const message = error instanceof Error ? error.message : String(error);
+			// Leading newline: the progress line is written without one.
+			process.stdout.write(
+				`\n  Fetching ${what} failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${message}` +
+					` — retrying in ${delay / 1000}s\n`
+			);
+			await sleep(delay);
+		}
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;
