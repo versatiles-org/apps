@@ -55,7 +55,7 @@
 		"svelte-check": "^4.7.6",
 		"svelte-highlight": "^7.20.1",
 		"tsx": "^4.23.13",
-		"typescript": "6.0.3",
+		"typescript": "7.0.2",
 		"typescript-eslint": "^8.69.0",
 		"vite": "^8.2.2",
 		"vitest": "^5.0.0"
